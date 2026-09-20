@@ -2,6 +2,22 @@
 
 from __future__ import annotations
 
+import os
+
+# Must be set before importing JAX.
+os.environ.setdefault(
+    "JAX_COMPILATION_CACHE_DIR",
+    os.path.expanduser("~/.cache/jax-mrt"),
+)
+os.environ.setdefault(
+    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+    "0",
+)
+os.environ.setdefault(
+    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES",
+    "-1",
+)
+
 import argparse
 import queue
 import shutil
@@ -20,57 +36,56 @@ from magenta_rt.config import MUSICCOCA
 
 
 # ============================================================
-# Recommended defaults
+# Configuration
 # ============================================================
 
-#
-# For music-like conditioning:
-#
-#   30-40 sec = more focused / specific style
-#   50-60 sec = broader / more stable style
-#
-# 60 seconds is a good general default.
-#
-DEFAULT_CAPTURE_SECONDS = 60.0
+CAPTURE_SECONDS = 60.0
 
-# MusicCoCa uses 10-second audio windows.
 MUSICCOCA_WINDOW_SECONDS = 10.0
 
-# Change to mrt2_base if your ROCm GPU is fast enough.
-DEFAULT_MODEL = "mrt2_small"
+MODEL = "mrt2_small"
 
-# Generation chunk size.
+# Playback/output chunk size.
+CHUNK_SECONDS = 2.0
+
+# IMPORTANT:
+# Do NOT submit all 50 frames to MRT in one call.
 #
-# 25 MRT frames = 1 second.
+# 5 frames = 0.2 seconds.
 #
-DEFAULT_CHUNK_SECONDS = 8.0
+# mrt.generate() synchronizes at the end of each call, so this
+# limits how much ROCm work gets queued at once.
+GPU_BURST_FRAMES = 5
 
-# Start playback after this many generated chunks.
+# Tiny throttle after each synchronized burst.
 #
-# 3 x 8 sec = 24 seconds initial reserve.
-#
-DEFAULT_PREBUFFER_CHUNKS = 3
+# The overhead is insignificant:
+# 10 bursts/chunk * 0.005 = only ~50 ms per 2 sec audio.
+GPU_BURST_PAUSE_SECONDS = 0.005
 
-# Maximum waiting generated chunks.
-DEFAULT_QUEUE_CHUNKS = 12
+# Start with 6 seconds buffered.
+PREBUFFER_CHUNKS = 3
 
-DEFAULT_TEMPERATURE = 1.3
-DEFAULT_TOP_K = 40
+# Up to 24 seconds waiting.
+QUEUE_CHUNKS = 12
 
-DEFAULT_CFG_MUSICCOCA = 3.0
-DEFAULT_CFG_NOTES = 1.0
-DEFAULT_CFG_DRUMS = 1.0
+TEMPERATURE = 1.3
+TOP_K = 40
+
+CFG_MUSICCOCA = 3.0
+CFG_NOTES = 1.0
+CFG_DRUMS = 1.0
 
 
 # ============================================================
-# External commands
+# Utility
 # ============================================================
 
 def require_program(name: str) -> None:
     if shutil.which(name) is None:
         raise RuntimeError(
-            f"Required command '{name}' not found.\n\n"
-            f"Install system audio dependencies with:\n"
+            f"Required command '{name}' not found.\n"
+            f"Install dependencies with:\n"
             f"    sudo apt install ffmpeg pulseaudio-utils"
         )
 
@@ -85,15 +100,13 @@ def get_default_sink() -> str:
     ).strip()
 
     if not sink:
-        raise RuntimeError(
-            "Could not determine the default PulseAudio/PipeWire sink."
-        )
+        raise RuntimeError("Could not determine default audio sink.")
 
     return sink
 
 
 # ============================================================
-# Capture default Ubuntu output
+# Capture
 # ============================================================
 
 def capture_default_sink(
@@ -115,25 +128,6 @@ def capture_default_sink(
     print(f"Duration     : {seconds:.1f} seconds")
     print(f"Output       : {filename}")
     print()
-
-    if 30 <= seconds <= 60:
-        print(
-            "Capture duration is in the recommended "
-            "30-60 second music-conditioning range."
-        )
-    elif seconds < 30:
-        print(
-            "NOTE: For music-like synthesis, 30-60 seconds "
-            "usually gives a more stable style embedding."
-        )
-    else:
-        print(
-            "NOTE: More than 60 seconds is allowed, but MusicCoCa "
-            "will average more sections together, which can blur "
-            "distinct musical styles."
-        )
-
-    print()
     print("Recording whatever is playing through the default sink...")
     print()
 
@@ -145,29 +139,18 @@ def capture_default_sink(
     subprocess.run(
         [
             "ffmpeg",
-
             "-hide_banner",
-            "-loglevel",
-            "warning",
+            "-loglevel", "warning",
             "-y",
 
-            "-f",
-            "pulse",
+            "-f", "pulse",
+            "-i", monitor,
 
-            "-i",
-            monitor,
+            "-t", str(seconds),
 
-            "-t",
-            str(seconds),
-
-            "-ac",
-            "2",
-
-            "-ar",
-            "48000",
-
-            "-c:a",
-            "pcm_s16le",
+            "-ac", "2",
+            "-ar", "48000",
+            "-c:a", "pcm_s16le",
 
             str(filename),
         ],
@@ -175,14 +158,7 @@ def capture_default_sink(
     )
 
     if not filename.exists():
-        raise RuntimeError(
-            f"Capture file wasn't created: {filename}"
-        )
-
-    if filename.stat().st_size < 1000:
-        raise RuntimeError(
-            "Captured WAV appears empty."
-        )
+        raise RuntimeError("Capture file was not created.")
 
     print()
     print(
@@ -192,91 +168,59 @@ def capture_default_sink(
 
 
 # ============================================================
-# Trim for MusicCoCa
+# MusicCoCa trimming
 # ============================================================
 
 def trim_for_musiccoca(
     wav: Waveform,
-    window_seconds: float = MUSICCOCA_WINDOW_SECONDS,
 ) -> Waveform:
-    """
-    Trim an audio prompt to an exact number of MusicCoCa windows.
 
-    MusicCoCa's current configuration uses 10-second windows.
-
-    For example:
-
-        60.02 sec -> 60.00 sec
-        57.3 sec  -> 50.00 sec
-        38.4 sec  -> 30.00 sec
-
-    This avoids creating a final mostly-zero-padded MusicCoCa window.
-    """
-
-    samples_per_window = round(
-        wav.sample_rate * window_seconds
+    samples_per_window = int(
+        wav.sample_rate * MUSICCOCA_WINDOW_SECONDS
     )
 
+    total_samples = len(wav.samples)
+
     full_windows = (
-        wav.num_samples
-        // samples_per_window
+        total_samples // samples_per_window
     )
 
     if full_windows < 1:
         raise RuntimeError(
-            f"Audio prompt must contain at least "
-            f"{window_seconds:.0f} seconds."
+            "Audio prompt must contain at least 10 seconds."
         )
 
     usable_samples = (
-        full_windows
-        * samples_per_window
+        full_windows * samples_per_window
     )
 
-    original_seconds = wav.seconds
+    original_seconds = (
+        total_samples / wav.sample_rate
+    )
+
+    usable_seconds = (
+        usable_samples / wav.sample_rate
+    )
 
     trimmed = wav[:usable_samples]
-
-    removed_seconds = (
-        original_seconds
-        - trimmed.seconds
-    )
 
     print()
     print("==================================================")
     print("MUSICCOCA WINDOW TRIMMING")
     print("==================================================")
-
-    print(
-        f"Original duration : "
-        f"{original_seconds:.3f}s"
-    )
-
-    print(
-        f"Window size       : "
-        f"{window_seconds:.1f}s"
-    )
-
-    print(
-        f"Full windows      : "
-        f"{full_windows}"
-    )
-
-    print(
-        f"Usable duration   : "
-        f"{trimmed.seconds:.3f}s"
-    )
-
+    print(f"Original duration : {original_seconds:.3f}s")
+    print(f"Full windows      : {full_windows}")
+    print(f"Usable duration   : {usable_seconds:.3f}s")
     print(
         f"Removed tail      : "
-        f"{removed_seconds:.3f}s"
+        f"{original_seconds - usable_seconds:.3f}s"
     )
 
     return trimmed
 
 
 # ============================================================
-# MRT Waveform -> raw PulseAudio PCM
+# Waveform -> PCM
 # ============================================================
 
 def waveform_to_pcm_s16le(
@@ -290,8 +234,8 @@ def waveform_to_pcm_s16le(
 
     if wav.sample_rate != 48000:
         raise RuntimeError(
-            f"Expected MRT output at 48000 Hz, "
-            f"got {wav.sample_rate} Hz"
+            f"Expected 48000 Hz MRT output, "
+            f"got {wav.sample_rate}"
         )
 
     if samples.ndim == 1:
@@ -299,18 +243,16 @@ def waveform_to_pcm_s16le(
 
     if samples.ndim != 2:
         raise RuntimeError(
-            f"Unexpected MRT waveform shape: "
-            f"{samples.shape}"
+            f"Unexpected waveform shape: {samples.shape}"
         )
 
-    # Handle [channels, samples] if necessary.
+    # Handle channel-first output if encountered.
     if (
         samples.shape[0] in (1, 2)
         and samples.shape[1] > 2
     ):
         samples = samples.T
 
-    # Mono -> stereo.
     if samples.shape[1] == 1:
         samples = np.repeat(
             samples,
@@ -320,8 +262,7 @@ def waveform_to_pcm_s16le(
 
     if samples.shape[1] != 2:
         raise RuntimeError(
-            f"Expected stereo audio, "
-            f"got {samples.shape}"
+            f"Expected stereo output, got {samples.shape}"
         )
 
     samples = np.nan_to_num(
@@ -345,10 +286,149 @@ def waveform_to_pcm_s16le(
 
 
 # ============================================================
+# SAFER ROCm generation
+# ============================================================
+
+def generate_chunk_safely(
+    mrt,
+    conditioning,
+    total_frames: int,
+    state,
+    chunk_number: int,
+):
+    """
+    Generate one logical audio chunk using several small MRT calls.
+
+    This is deliberately different from:
+
+        mrt.generate(..., frames=50)
+
+    because MRT internally submits every streaming step before doing its
+    final device_get().
+
+    Instead we do:
+
+        5 frames -> synchronize
+        5 frames -> synchronize
+        ...
+        5 frames -> synchronize
+
+    This reduces sustained AQL/MES queue pressure on gfx1151.
+    """
+
+    total_seconds = (
+        total_frames / 25.0
+    )
+
+    print(
+        f"[MRT] START chunk {chunk_number:05d}: "
+        f"{total_frames} frames / "
+        f"{total_seconds:.2f}s audio",
+        flush=True,
+    )
+
+    start = time.perf_counter()
+
+    pcm_parts: list[bytes] = []
+
+    frames_remaining = total_frames
+
+    burst_number = 0
+
+    while frames_remaining > 0:
+
+        burst_number += 1
+
+        burst_frames = min(
+            GPU_BURST_FRAMES,
+            frames_remaining,
+        )
+
+        burst_start = time.perf_counter()
+
+        #
+        # IMPORTANT:
+        #
+        # mrt.generate() performs jax.device_get() before returning.
+        # Therefore each small call becomes a GPU synchronization
+        # point instead of letting dozens of streaming steps build up.
+        #
+        wav, state = mrt.generate(
+            conditioning=conditioning,
+            frames=burst_frames,
+            state=state,
+        )
+
+        burst_elapsed = (
+            time.perf_counter()
+            - burst_start
+        )
+
+        pcm_parts.append(
+            waveform_to_pcm_s16le(wav)
+        )
+
+        frames_remaining -= burst_frames
+
+        generated_frames = (
+            total_frames - frames_remaining
+        )
+
+        print(
+            f"      burst {burst_number:02d}: "
+            f"{burst_frames} frames in "
+            f"{burst_elapsed:.3f}s "
+            f"[{generated_frames}/{total_frames}]",
+            flush=True,
+        )
+
+        #
+        # Tiny submission throttle.
+        #
+        # This is intentionally here even though device_get()
+        # already synchronizes.
+        #
+        if (
+            frames_remaining > 0
+            and GPU_BURST_PAUSE_SECONDS > 0
+        ):
+            time.sleep(
+                GPU_BURST_PAUSE_SECONDS
+            )
+
+    elapsed = (
+        time.perf_counter()
+        - start
+    )
+
+    realtime = (
+        total_seconds / elapsed
+    )
+
+    pcm = b"".join(
+        pcm_parts
+    )
+
+    print(
+        f"[MRT] DONE  chunk {chunk_number:05d}: "
+        f"{total_seconds:.2f}s audio in "
+        f"{elapsed:.2f}s "
+        f"({realtime:.2f}x RT)",
+        flush=True,
+    )
+
+    return (
+        pcm,
+        state,
+        elapsed,
+    )
+
+
+# ============================================================
 # Playback
 # ============================================================
 
-def start_playback() -> subprocess.Popen:
+def start_playback():
 
     require_program("pacat")
 
@@ -359,12 +439,10 @@ def start_playback() -> subprocess.Popen:
     print("PLAYBACK")
     print("==================================================")
     print(f"Output sink: {sink}")
-    print()
 
-    proc = subprocess.Popen(
+    process = subprocess.Popen(
         [
             "pacat",
-
             "--playback",
             "--raw",
 
@@ -380,14 +458,12 @@ def start_playback() -> subprocess.Popen:
         bufsize=0,
     )
 
-    if proc.stdin is None:
-        proc.terminate()
-
+    if process.stdin is None:
         raise RuntimeError(
             "Could not open pacat playback stream."
         )
 
-    return proc
+    return process
 
 
 # ============================================================
@@ -396,21 +472,12 @@ def start_playback() -> subprocess.Popen:
 
 def main() -> int:
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "Capture system audio, use it as an MRT2 MusicCoCa "
-            "style prompt, and continuously generate music."
-        )
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--capture-seconds",
         type=float,
-        default=DEFAULT_CAPTURE_SECONDS,
-        help=(
-            "Seconds to capture. "
-            "30-60 is recommended; default: 60."
-        ),
+        default=CAPTURE_SECONDS,
     )
 
     parser.add_argument(
@@ -420,7 +487,7 @@ def main() -> int:
 
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
+        default=MODEL,
         choices=[
             "mrt2_small",
             "mrt2_base",
@@ -430,61 +497,40 @@ def main() -> int:
     parser.add_argument(
         "--chunk-seconds",
         type=float,
-        default=DEFAULT_CHUNK_SECONDS,
+        default=CHUNK_SECONDS,
     )
 
     parser.add_argument(
         "--prebuffer-chunks",
         type=int,
-        default=DEFAULT_PREBUFFER_CHUNKS,
+        default=PREBUFFER_CHUNKS,
     )
 
     parser.add_argument(
         "--queue-chunks",
         type=int,
-        default=DEFAULT_QUEUE_CHUNKS,
-    )
-
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=DEFAULT_TEMPERATURE,
-    )
-
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=DEFAULT_TOP_K,
+        default=QUEUE_CHUNKS,
     )
 
     args = parser.parse_args()
-
-    if args.capture_seconds < 10:
-        parser.error(
-            "--capture-seconds must be at least 10 seconds."
-        )
-
-    if args.chunk_seconds <= 0:
-        parser.error(
-            "--chunk-seconds must be greater than zero."
-        )
-
-    if args.prebuffer_chunks < 1:
-        parser.error(
-            "--prebuffer-chunks must be >= 1."
-        )
-
-    if args.queue_chunks < args.prebuffer_chunks:
-        parser.error(
-            "--queue-chunks must be >= --prebuffer-chunks."
-        )
 
     capture_file = Path(
         args.capture_file
     ).expanduser().resolve()
 
+    frames_per_chunk = max(
+        1,
+        round(
+            args.chunk_seconds * 25
+        ),
+    )
+
+    chunk_seconds = (
+        frames_per_chunk / 25.0
+    )
+
     # ========================================================
-    # 1. Capture reference music
+    # Capture
     # ========================================================
 
     capture_default_sink(
@@ -493,70 +539,55 @@ def main() -> int:
     )
 
     # ========================================================
-    # 2. JAX / GPU information
+    # JAX
     # ========================================================
 
     print()
     print("==================================================")
     print("JAX")
     print("==================================================")
-
+    print(f"JAX version : {jax.__version__}")
+    print(f"Backend     : {jax.default_backend()}")
+    print(f"Devices     : {jax.devices()}")
     print(
-        f"JAX version : "
-        f"{jax.__version__}"
-    )
-
-    print(
-        f"Backend     : "
-        f"{jax.default_backend()}"
-    )
-
-    print(
-        f"Devices     : "
-        f"{jax.devices()}"
+        f"Cache       : "
+        f"{os.environ['JAX_COMPILATION_CACHE_DIR']}"
     )
 
     # ========================================================
-    # 3. Load MRT
+    # Load MRT
     # ========================================================
 
     print()
     print("==================================================")
     print("LOADING MRT")
     print("==================================================")
-
-    print(
-        f"Model: {args.model}"
-    )
+    print(f"Model: {args.model}")
 
     mrt = MagentaRT2Jax(
         size=args.model,
 
-        temperature=args.temperature,
-        top_k=args.top_k,
+        temperature=TEMPERATURE,
+        top_k=TOP_K,
 
         cfg_scales={
-            "musiccoca": DEFAULT_CFG_MUSICCOCA,
-            "notes": DEFAULT_CFG_NOTES,
-            "drums": DEFAULT_CFG_DRUMS,
+            "musiccoca": CFG_MUSICCOCA,
+            "notes": CFG_NOTES,
+            "drums": CFG_DRUMS,
         },
     )
 
-    print()
     print("MRT loaded.")
 
     # ========================================================
-    # 4. Load captured WAV
+    # Prompt
     # ========================================================
 
     print()
     print("==================================================")
     print("AUDIO PROMPT")
     print("==================================================")
-
-    print(
-        f"Loading: {capture_file}"
-    )
+    print(f"Loading: {capture_file}")
 
     prompt_audio = Waveform.from_file(
         str(capture_file)
@@ -573,17 +604,12 @@ def main() -> int:
         f"{prompt_audio.num_channels} channels"
     )
 
-    # ========================================================
-    # 5. IMPORTANT:
-    # Trim to complete 10-second MusicCoCa windows.
-    # ========================================================
-
     prompt_audio = trim_for_musiccoca(
         prompt_audio
     )
 
     # ========================================================
-    # 6. Audio -> MusicCoCa embedding
+    # MusicCoCa
     # ========================================================
 
     print()
@@ -593,25 +619,18 @@ def main() -> int:
 
     print(
         f"Embedding "
-        f"{prompt_audio.seconds:.1f}s "
-        f"of audio..."
+        f"{prompt_audio.seconds:.1f}s of audio..."
     )
 
     style_embedding = mrt.embed_style(
         prompt_audio,
-
-        # Average the complete set of 10-second style embeddings.
         pool_across_time=True,
-
-        # Audio prompt: don't use the text->audio mapper.
         use_mapper=False,
     )
 
     print(
         "Style embedding:",
-        np.asarray(
-            style_embedding
-        ).shape,
+        np.asarray(style_embedding).shape,
     )
 
     style_tokens = mrt.tokenize_style(
@@ -620,9 +639,7 @@ def main() -> int:
 
     print(
         "Style tokens:",
-        np.asarray(
-            style_tokens
-        ).shape,
+        np.asarray(style_tokens).shape,
     )
 
     conditioning = {
@@ -630,56 +647,63 @@ def main() -> int:
     }
 
     # ========================================================
-    # 7. Generation configuration
+    # Warmup
     # ========================================================
-
-    frames_per_chunk = max(
-        1,
-        round(
-            args.chunk_seconds * 25
-        ),
-    )
-
-    actual_chunk_seconds = (
-        frames_per_chunk / 25.0
-    )
-
-    prebuffer_seconds = (
-        actual_chunk_seconds
-        * args.prebuffer_chunks
-    )
 
     print()
     print("==================================================")
-    print("CONTINUOUS GENERATION")
+    print("GPU WARMUP")
     print("==================================================")
 
-    print(
-        f"Frames/chunk : "
-        f"{frames_per_chunk}"
+    t0 = time.perf_counter()
+
+    warmup_wav, _ = mrt.generate(
+        conditioning=conditioning,
+        frames=1,
+        state=None,
+    )
+
+    _ = waveform_to_pcm_s16le(
+        warmup_wav
     )
 
     print(
-        f"Audio/chunk  : "
-        f"{actual_chunk_seconds:.2f}s"
+        f"GPU warmup finished in "
+        f"{time.perf_counter() - t0:.2f}s"
     )
 
-    print(
-        f"Prebuffer    : "
-        f"{args.prebuffer_chunks} chunks "
-        f"({prebuffer_seconds:.1f}s)"
-    )
-
-    print(
-        f"Queue        : "
-        f"{args.queue_chunks} chunks"
-    )
+    # Fresh stream after warmup.
+    state = None
 
     # ========================================================
-    # 8. Producer queue
+    # Generation setup
     # ========================================================
 
-    audio_queue: queue.Queue[bytes] = queue.Queue(
+    print()
+    print("==================================================")
+    print("GENERATION")
+    print("==================================================")
+    print(f"Chunk size      : {chunk_seconds:.2f}s")
+    print(f"Frames/chunk    : {frames_per_chunk}")
+    print(f"GPU burst       : {GPU_BURST_FRAMES} frames")
+    print(
+        f"GPU burst audio : "
+        f"{GPU_BURST_FRAMES / 25:.2f}s"
+    )
+    print(
+        f"Burst pause     : "
+        f"{GPU_BURST_PAUSE_SECONDS * 1000:.1f} ms"
+    )
+    print(
+        f"Initial buffer  : "
+        f"{args.prebuffer_chunks * chunk_seconds:.1f}s"
+    )
+    print(
+        f"Maximum queue   : "
+        f"{args.queue_chunks * chunk_seconds:.1f}s"
+    )
+
+    audio_queue = queue.Queue(
         maxsize=args.queue_chunks
     )
 
@@ -687,62 +711,64 @@ def main() -> int:
 
     producer_errors: list[BaseException] = []
 
-    generation_speeds: list[float] = []
-
     # ========================================================
-    # 9. Continuous MRT generator
+    # First chunk synchronously
     # ========================================================
 
-    def generate_forever() -> None:
+    first_pcm, state, first_elapsed = (
+        generate_chunk_safely(
+            mrt=mrt,
+            conditioning=conditioning,
+            total_frames=frames_per_chunk,
+            state=state,
+            chunk_number=1,
+        )
+    )
 
-        state = None
-        chunk_number = 1
+    prebuffer = [
+        first_pcm
+    ]
+
+    generation_state = state
+
+    # ========================================================
+    # Producer
+    # ========================================================
+
+    def generator():
+
+        nonlocal generation_state
+
+        chunk_number = 2
+
+        speeds: list[float] = []
 
         try:
 
             while not stop_event.is_set():
 
-                start = time.perf_counter()
-
-                wav, state = mrt.generate(
-                    conditioning=conditioning,
-
-                    frames=frames_per_chunk,
-
-                    # Maintain continuation state between chunks.
-                    state=state,
-                )
-
-                # Force asynchronous JAX computation to complete.
-                _ = np.asarray(
-                    wav.samples
-                )
-
-                elapsed = (
-                    time.perf_counter()
-                    - start
+                pcm, generation_state, elapsed = (
+                    generate_chunk_safely(
+                        mrt=mrt,
+                        conditioning=conditioning,
+                        total_frames=frames_per_chunk,
+                        state=generation_state,
+                        chunk_number=chunk_number,
+                    )
                 )
 
                 speed = (
-                    actual_chunk_seconds
-                    / elapsed
+                    chunk_seconds / elapsed
                 )
 
-                generation_speeds.append(
-                    speed
-                )
+                speeds.append(speed)
 
-                # Recent rolling average.
-                if len(generation_speeds) > 20:
-                    generation_speeds.pop(0)
+                if len(speeds) > 20:
+                    speeds.pop(0)
 
-                average_speed = (
-                    sum(generation_speeds)
-                    / len(generation_speeds)
-                )
-
-                pcm = waveform_to_pcm_s16le(
-                    wav
+                average = (
+                    sum(speeds)
+                    / len(speeds)
                 )
 
                 while not stop_event.is_set():
@@ -759,18 +785,11 @@ def main() -> int:
                     except queue.Full:
                         continue
 
-                buffer_seconds = (
-                    audio_queue.qsize()
-                    * actual_chunk_seconds
-                )
-
                 print(
-                    f"Generated chunk {chunk_number:05d}: "
-                    f"{actual_chunk_seconds:.1f}s audio "
-                    f"in {elapsed:.2f}s | "
-                    f"{speed:.2f}x RT | "
-                    f"avg {average_speed:.2f}x | "
-                    f"buffer {buffer_seconds:.0f}s",
+                    f"[MRT] rolling average "
+                    f"{average:.2f}x RT | "
+                    f"queue "
+                    f"{audio_queue.qsize() * chunk_seconds:.1f}s",
                     flush=True,
                 )
 
@@ -785,7 +804,7 @@ def main() -> int:
             stop_event.set()
 
     generator_thread = threading.Thread(
-        target=generate_forever,
+        target=generator,
         name="mrt-generator",
         daemon=True,
     )
@@ -793,22 +812,16 @@ def main() -> int:
     generator_thread.start()
 
     # ========================================================
-    # 10. Prebuffer
+    # Initial prebuffer
     # ========================================================
 
     print()
     print(
-        f"Pre-generating "
-        f"{prebuffer_seconds:.0f}s "
-        f"before playback..."
+        f"Building initial "
+        f"{args.prebuffer_chunks * chunk_seconds:.1f}s buffer..."
     )
 
-    prebuffer: list[bytes] = []
-
-    while (
-        len(prebuffer)
-        < args.prebuffer_chunks
-    ):
+    while len(prebuffer) < args.prebuffer_chunks:
 
         if producer_errors:
             raise producer_errors[0]
@@ -816,11 +829,10 @@ def main() -> int:
         try:
 
             pcm = audio_queue.get(
-                timeout=0.5,
+                timeout=0.5
             )
 
         except queue.Empty:
-
             continue
 
         prebuffer.append(
@@ -828,27 +840,26 @@ def main() -> int:
         )
 
         print(
-            f"Prebuffer: "
-            f"{len(prebuffer)}/"
-            f"{args.prebuffer_chunks} "
-            f"({len(prebuffer) * actual_chunk_seconds:.0f}s)"
+            f"Buffered: "
+            f"{len(prebuffer) * chunk_seconds:.1f}s / "
+            f"{args.prebuffer_chunks * chunk_seconds:.1f}s",
+            flush=True,
         )
 
     # ========================================================
-    # 11. Start playback
+    # Playback
     # ========================================================
 
     player = start_playback()
 
     assert player.stdin is not None
 
+    print()
     print(
-        f"Starting with "
-        f"{prebuffer_seconds:.0f}s "
-        f"of generated audio."
+        f"Starting playback with "
+        f"{len(prebuffer) * chunk_seconds:.1f}s ready."
     )
 
-    print()
     print("Press Ctrl+C to stop.")
     print()
 
@@ -861,7 +872,7 @@ def main() -> int:
     player.stdin.flush()
 
     # ========================================================
-    # 12. Continuous playback
+    # Continuous playback
     # ========================================================
 
     last_warning = 0.0
@@ -889,11 +900,11 @@ def main() -> int:
 
                 now = time.monotonic()
 
-                if now - last_warning >= 5.0:
+                if now - last_warning >= 3.0:
 
                     print(
-                        "WARNING: playback buffer empty; "
-                        "MRT generation is not keeping up.",
+                        "WARNING: playback queue empty; "
+                        "waiting for generation.",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -902,17 +913,11 @@ def main() -> int:
 
                 continue
 
-            try:
+            player.stdin.write(
+                pcm
+            )
 
-                player.stdin.write(
-                    pcm
-                )
-
-            except BrokenPipeError as exc:
-
-                raise RuntimeError(
-                    "pacat playback pipe closed."
-                ) from exc
+            player.stdin.flush()
 
     except KeyboardInterrupt:
 
@@ -922,11 +927,6 @@ def main() -> int:
     finally:
 
         stop_event.set()
-
-        try:
-            player.stdin.flush()
-        except Exception:
-            pass
 
         try:
             player.stdin.close()
@@ -939,13 +939,10 @@ def main() -> int:
             pass
 
         try:
-
             player.wait(
                 timeout=2
             )
-
         except subprocess.TimeoutExpired:
-
             player.kill()
 
         generator_thread.join(
@@ -961,13 +958,11 @@ def main() -> int:
 if __name__ == "__main__":
 
     try:
-
         raise SystemExit(
             main()
         )
 
     except KeyboardInterrupt:
-
         raise SystemExit(130)
 
     except Exception as exc:
