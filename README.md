@@ -16,3 +16,6 @@ mrt models download
 mrt checkpoints download
 
 ```
+My gpu wasn't powerful enough to use mrt_base instead of mrt_small although I found the soundscapes of similar quality.
+
+Would consider testing audio generation on a more powerful gpu.
