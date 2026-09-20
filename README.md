@@ -1,3 +1,6 @@
+# Clone your soundscape into realtime audio
+Goal:  Take audio sample, use audio sample to generate continuous stream of AI music/sound
+
 ```bash
 git clone git@github.com:magenta/magenta-realtime.git
 cd magenta-realtime
